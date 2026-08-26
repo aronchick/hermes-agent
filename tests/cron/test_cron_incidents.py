@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -115,6 +116,134 @@ def test_error_change_mints_new_incident(monkeypatch, tmp_path):
     assert id1 != id2
     assert new2 is True
     assert inc.count_incidents() == 2
+
+
+def test_open_brain_402_payload_dedups_volatile_run_metadata(monkeypatch, tmp_path):
+    """The Open Brain failure is one causal 402, even though every
+    capture run emits fresh provenance metadata and counters."""
+    inc = _point_db(monkeypatch, tmp_path)
+    first = (
+        "Open Brain capture failed: HTTP 402 Payment Required; "
+        '{"error":"insufficient credits",'
+        '"timestamp":"2026-08-26T16:04:31.912Z",'
+        '"source_id":"src_01J6A8B9C0D1E2F3G4H5J6K7M8",'
+        '"path":"/Users/example/Library/Caches/open-brain/run-1842/capture.json",'
+        '"captured":37,"skipped":4,"receipt":"rcpt_8f5e4d3c2b1a"}'
+    )
+    second = (
+        "Open Brain capture failed: HTTP 402 Payment Required; "
+        '{"error":"insufficient credits",'
+        '"timestamp":"2026-08-26T16:09:32.044Z",'
+        '"source_id":"src_01J6A8ZZZZZZZZZZZZZZZZZZZZ",'
+        '"path":"/private/var/folders/xy/run-1907/capture.json",'
+        '"captured":52,"skipped":9,"receipt":"rcpt_fedcba987654"}'
+    )
+
+    id1, new1 = inc.upsert_incident("open-brain", first)
+    id2, new2 = inc.upsert_incident("open-brain", second)
+
+    assert id1 == id2
+    assert new1 is True
+    assert new2 is False
+    assert inc.count_incidents() == 1
+
+
+def test_common_volatile_cron_errors_have_stable_signatures():
+    cases = [
+        (
+            "2026-08-26T16:04:31Z worker pid=1842 timed out after 60.1s "
+            "reading /tmp/hermes-run-a/output.json request_id=8dd13d62-4517-4fc7-9c6e-0bc1d31f094c",
+            "2026-08-26T16:09:32Z worker pid=1907 timed out after 61.7s "
+            "reading /private/var/tmp/hermes-run-b/output.json request_id=94df50d0-d5ef-4bc0-a4d7-e339692ffa97",
+        ),
+        (
+            "FileNotFoundError: [Errno 2] No such file or directory: "
+            "'/tmp/run-1842/result-17.json', line 91",
+            "FileNotFoundError: [Errno 2] No such file or directory: "
+            "'/private/var/tmp/run-1907/result-52.json', line 104",
+        ),
+        (
+            "delivery failed after processing 37 records (4 rejected); "
+            "source_id=source-a17 receipt=receipt-8f5e4d3c",
+            "delivery failed after processing 52 records (9 rejected); "
+            "source_id=source-b52 receipt=receipt-fedcba98",
+        ),
+    ]
+
+    for first, second in cases:
+        assert incidents._error_signature("job-1", first) == incidents._error_signature(
+            "job-1", second
+        )
+
+
+def test_causal_fingerprint_preserves_distinct_failures():
+    distinct_pairs = [
+        (
+            "Open Brain failed: HTTP 402 Payment Required: insufficient credits",
+            "Open Brain failed: HTTP 403 Forbidden: insufficient credits",
+        ),
+        (
+            "FileNotFoundError: [Errno 2] No such file: /tmp/run-a/result.json",
+            "PermissionError: [Errno 13] Permission denied: /tmp/run-a/result.json",
+        ),
+        ("provider connect timed out", "provider read timed out"),
+        (
+            "Open Brain failed: HTTP 402 Payment Required: insufficient credits",
+            "Open Brain failed: HTTP 402 Payment Required: workspace disabled",
+        ),
+    ]
+
+    for first, second in distinct_pairs:
+        assert incidents._error_signature("job-1", first) != incidents._error_signature(
+            "job-1", second
+        )
+
+
+def test_fingerprint_does_not_vary_with_secret_material():
+    first = "HTTP 402 using token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"
+    second = "HTTP 402 using token ghp_ZYXWVUTSRQPONMLKJIHGFEDCBAjihgfedcba"
+
+    assert incidents._error_signature("job-1", first) == incidents._error_signature(
+        "job-1", second
+    )
+
+
+def test_legacy_acked_incident_is_reused_by_causal_fingerprint(
+    monkeypatch, tmp_path
+):
+    """Upgrading the signer must not resurrect a closed pre-upgrade incident."""
+    inc = _point_db(monkeypatch, tmp_path)
+    old_error = (
+        "Open Brain failed: HTTP 402 insufficient credits "
+        "timestamp=2026-08-26T16:04:31Z source_id=source-a receipt=receipt-a"
+    )
+    new_error = (
+        "Open Brain failed: HTTP 402 insufficient credits "
+        "timestamp=2026-08-26T16:09:32Z source_id=source-b receipt=receipt-b"
+    )
+    legacy_normalized = inc._normalize_error(old_error)[:200]
+    legacy_sig = hashlib.sha256(
+        b"open-brain" + legacy_normalized.encode()
+    ).hexdigest()[:12]
+    legacy_id = inc._incident_id("open-brain", legacy_sig)
+    with inc._transaction() as conn:
+        conn.execute(
+            """INSERT INTO cron_incidents
+               (id, job_id, error_sig, state, failure_type,
+                first_seen_at, last_seen_at, acked_at, closed_at, error)
+               VALUES (?, 'open-brain', ?, 'closed', 'unknown',
+                       '2026-08-26T16:04:31+00:00', '2026-08-26T16:04:31+00:00',
+                       '2026-08-26T16:05:00+00:00', '2026-08-26T16:05:00+00:00', ?)
+            """,
+            (legacy_id, legacy_sig, old_error),
+        )
+
+    incident_id, is_new = inc.upsert_incident("open-brain", new_error)
+
+    assert incident_id == legacy_id
+    assert is_new is False
+    assert inc.get_incident(legacy_id)["state"] == "closed"
+    assert inc.count_incidents() == 1
 
 
 # ── Redaction / classification ─────────────────────────────────────────────

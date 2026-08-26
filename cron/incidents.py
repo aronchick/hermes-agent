@@ -6,9 +6,9 @@ signature)`` so the same job failing with the same error does not re-ping the
 operator every run once they have acknowledged it.
 
 Lifecycle: ``detected`` → ``alerted`` → ``closed``. Closing
-(acking) an incident is per-signature: the same job + same normalized error
-keeps resolving to the SAME incident id, so a closed incident stays closed (no
-re-alert) until the error text changes, which mints a brand-new incident.
+(acking) an incident is per-signature: the same job + same causal failure keeps
+resolving to the SAME incident id, so a closed incident stays closed (no
+re-alert) until the cause changes, which mints a brand-new incident.
 ``detected`` means the failure was recorded; ``alerted`` means at least one
 failure ping for the signature actually reached the operator. Richer states
 (e.g. a dv9.6 ``reviewed``) are deliberately NOT reserved here — state
@@ -47,7 +47,58 @@ _FAILURE_TYPE_ORDER = (
     ("agent", ("agent", "model", "provider", "inference")),
 )
 MAX_ERROR_CHARS = 500
-_MAX_SIGNATURE_ERROR_CHARS = 200
+
+_SECRET_MASK_RE = re.compile(
+    r"(?:[a-z0-9_-]{2,16}\.\.\.[a-z0-9_-]{2,16}|\*{3,}|"
+    r"«redacted[^»]*»|\[redacted[^\]]*\])",
+    re.IGNORECASE,
+)
+_HTTP_STATUS_RE = re.compile(
+    r"\b(?:http(?:\s+status)?|status(?:\s+code)?)\s*[:=#-]?\s*([1-5]\d{2})\b",
+    re.IGNORECASE,
+)
+_BARE_HTTP_STATUS_RE = re.compile(r"(?<!\d)([45]\d{2})(?!\d)")
+_ERRNO_RE = re.compile(
+    r"(?:\[\s*)?errno\s*[:=#-]?\s*(\d+)(?:\s*\])?",
+    re.IGNORECASE,
+)
+_EXIT_CODE_RE = re.compile(
+    r"\b(?:exit(?:ed)?(?:\s+with)?(?:\s+code)?|return(?:ed)?(?:\s+code)?)"
+    r"\s*[:=#-]?\s*(\d+)\b",
+    re.IGNORECASE,
+)
+_VOLATILE_FIELD_RE = re.compile(
+    r"\b(?P<key>"
+    r"timestamp|time|pid|path|receipt(?:[_-]?id)?|"
+    r"(?:source|request|run|execution|trace|span|event|correlation)[_-]?id"
+    r")\b[\"']?\s*[:=]\s*"
+    r"(?P<quote>[\"']?)(?P<value>[^\"'\s,;}\]]+)(?P=quote)",
+    re.IGNORECASE,
+)
+_ISO_TIMESTAMP_RE = re.compile(
+    r"(?<!\w)\d{4}-\d{2}-\d{2}"
+    r"(?:[t ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:?\d{2})?)?",
+    re.IGNORECASE,
+)
+_UUID_RE = re.compile(
+    r"(?<![a-z0-9])[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}(?![a-z0-9])",
+    re.IGNORECASE,
+)
+_LONG_IDENTIFIER_RE = re.compile(
+    r"(?<![a-z0-9])(?:[0-9a-f]{16,}|[0-9a-hjkmnp-tv-z]{26})(?![a-z0-9])",
+    re.IGNORECASE,
+)
+_IPV4_RE = re.compile(r"(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)")
+_QUOTED_PATH_RE = re.compile(
+    r"(?P<quote>[\"'])(?:[a-z]:[\\/]|/)[^\"']+(?P=quote)",
+    re.IGNORECASE,
+)
+_UNQUOTED_PATH_RE = re.compile(
+    r"(?<![\w:/])(?:[a-z]:[\\/]|/)[^\s,;:)\]}]+",
+    re.IGNORECASE,
+)
+_NUMBER_RE = re.compile(r"(?<!\w)[+-]?\d+(?:[.,]\d+)?(?!\d)")
 
 _lock = threading.RLock()
 
@@ -134,22 +185,68 @@ def _normalize_error(error: str) -> str:
 
 
 def _redact_error(error: str) -> str:
-    """Redact secrets then bound the stored error length."""
+    """Force-redact secrets then bound the durably stored error length."""
     text = str(error or "")
     try:
         from agent.redact import redact_sensitive_text
 
-        text = redact_sensitive_text(text)
+        text = redact_sensitive_text(
+            text,
+            force=True,
+            redact_url_credentials=True,
+        )
     except Exception:
         # Redaction is best-effort; the scheduler path never fails on it.
         pass
     return text[:MAX_ERROR_CHARS]
 
 
+def _causal_error(error: str) -> str:
+    """Return a privacy-safe, volatility-insensitive description of a cause.
+
+    Cron output commonly embeds fresh provenance on every run. Hashing that
+    text verbatim turns one recurring failure into an unbounded series of
+    incidents. Preserve semantic markers (HTTP status, errno, exit code,
+    exception/message wording) while replacing run-specific timestamps,
+    identifiers, paths, counters, and redacted credential fragments.
+
+    The same bounded, force-redacted representation is used for new keys and
+    for matching pre-upgrade rows, so acknowledged incidents keep their
+    terminal lifecycle state across the signer upgrade.
+    """
+    text = _normalize_error(_redact_error(error))
+    text = _SECRET_MASK_RE.sub("<secret>", text)
+    text = _HTTP_STATUS_RE.sub(lambda match: f"http_status_{match.group(1)}", text)
+    text = _ERRNO_RE.sub(lambda match: f"errno_{match.group(1)}", text)
+    text = _EXIT_CODE_RE.sub(lambda match: f"exit_code_{match.group(1)}", text)
+    text = _BARE_HTTP_STATUS_RE.sub(
+        lambda match: f"http_status_{match.group(1)}", text
+    )
+
+    def _replace_volatile_field(match: re.Match[str]) -> str:
+        key = match.group("key").lower().replace("-", "_")
+        return f"{key}=<volatile>"
+
+    text = _VOLATILE_FIELD_RE.sub(_replace_volatile_field, text)
+    text = _ISO_TIMESTAMP_RE.sub("<timestamp>", text)
+    text = _UUID_RE.sub("<id>", text)
+    text = _LONG_IDENTIFIER_RE.sub("<id>", text)
+    text = _IPV4_RE.sub("<ip>", text)
+    text = _QUOTED_PATH_RE.sub(
+        lambda match: f'{match.group("quote")}<path>{match.group("quote")}',
+        text,
+    )
+    text = _UNQUOTED_PATH_RE.sub("<path>", text)
+    text = _NUMBER_RE.sub("<number>", text)
+    return _normalize_error(text)
+
+
 def _error_signature(job_id: str, error: str) -> str:
-    """Dedup key: stable for same job + same normalized error prefix."""
-    normalized = _normalize_error(error)[:_MAX_SIGNATURE_ERROR_CHARS]
-    digest = hashlib.sha256(job_id.encode() + normalized.encode()).hexdigest()
+    """Dedup key: stable for the same job and causal failure."""
+    causal_error = _causal_error(error)
+    digest = hashlib.sha256(
+        job_id.encode() + b"\0cron-incident-v2\0" + causal_error.encode()
+    ).hexdigest()
     return digest[:12]
 
 
@@ -182,10 +279,10 @@ def upsert_incident(
 ) -> tuple[str, bool]:
     """Record (or refresh) the incident for ``job_id`` + ``error``.
 
-    Returns ``(incident_id, is_new)``. A row for the same signature already
+    Returns ``(incident_id, is_new)``. A row for the same causal signature
     existing refreshes ``last_seen_at``/``error``/``output_file`` and keeps its
     current state — a ``closed`` (acked) incident stays closed for the same
-    signature. A changed error text mints a new incident automatically.
+    cause. A changed cause mints a new incident automatically.
     """
     job_id = str(job_id or "")
     sig = _error_signature(job_id, error)
@@ -197,14 +294,41 @@ def upsert_incident(
 
     with _transaction() as conn:
         row = conn.execute(
-            "SELECT id FROM cron_incidents WHERE id=?", (incident_id,)
+            """SELECT id FROM cron_incidents
+               WHERE id=? OR (job_id=? AND error_sig=?)
+               ORDER BY CASE WHEN id=? THEN 0 ELSE 1 END
+               LIMIT 1""",
+            (incident_id, job_id, sig, incident_id),
         ).fetchone()
+        if row is None:
+            # Rows created by the v1 raw-prefix signer have a different id.
+            # Match their stored, redacted error causally so rollout does not
+            # resurrect an acknowledged incident. Prefer a closed match: if
+            # v1 split one cause into several volatile signatures, any ack of
+            # that cause remains authoritative.
+            candidates = conn.execute(
+                """SELECT id, error FROM cron_incidents
+                   WHERE job_id=?
+                   ORDER BY CASE WHEN state='closed' THEN 0 ELSE 1 END,
+                            last_seen_at DESC, id DESC""",
+                (job_id,),
+            ).fetchall()
+            causal_error = _causal_error(error)
+            row = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if _causal_error(candidate["error"]) == causal_error
+                ),
+                None,
+            )
         if row is not None:
+            incident_id = row["id"]
             conn.execute(
                 """UPDATE cron_incidents
-                   SET last_seen_at=?, error=?, output_file=?
+                   SET error_sig=?, last_seen_at=?, error=?, output_file=?
                    WHERE id=?""",
-                (now, stored_error, output_file, incident_id),
+                (sig, now, stored_error, output_file, incident_id),
             )
             return incident_id, False
         conn.execute(
