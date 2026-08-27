@@ -84,6 +84,14 @@ stdenv.mkDerivation {
   dontUnpack = true;
   dontBuild = true;
 
+  # mkFixLockfiles and the dev shell read npmLockfile/devShellHook off the
+  # package they're handed — forward them from the renderer, which is where
+  # mkNpmPassthru attached them.
+  passthru = {
+    inherit renderer;
+    inherit (renderer.passthru) npmLockfile devShellHook;
+  };
+
   nativeBuildInputs = [ makeWrapper ];
 
   installPhase = ''
