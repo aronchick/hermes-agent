@@ -75,13 +75,26 @@ jobs:
       - id: pick
         run: |
           set -euo pipefail
+          # The schedule fires in every fork that has Actions enabled, but a
+          # fork usually has no release tags: forking copies only the default
+          # branch, and tags cut upstream afterwards never sync down. Rather
+          # than fail twice a day with nothing to test, a fork without tags
+          # emits an empty matrix and the route jobs skip. Upstream keeps the
+          # script's hard failure, so a broken tag fetch there still surfaces.
+          if [ "$GITHUB_REPOSITORY" != 'NousResearch/hermes-agent' ] \
+            && [ -z "$(git tag --list 'v*')" ]; then
+            echo "::notice::$GITHUB_REPOSITORY has no release tags, so there is nothing to update from; skipping."
+            echo "tags=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           tags="$(scripts/sandbox/pick-release-tags.sh --count '${{ inputs.tag-count || 5 }}')"
           echo "Testing updates from: $tags"
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
 
   # `hermes update` -- the route most users take.
   update:
-    if: github.event_name != 'workflow_dispatch' || inputs.route != 'installer'
+    # An empty tag list is a fork with nothing to update from (see pick-releases).
+    if: needs.pick-releases.outputs.tags != '' && (github.event_name != 'workflow_dispatch' || inputs.route != 'installer')
     needs: pick-releases
     strategy:
       # One release breaking is worth knowing about even if another already
@@ -97,7 +110,7 @@ jobs:
   # Re-running the curl one-liner over an existing checkout: autostash + pull
   # rather than the updater's own git handling.
   installer:
-    if: github.event_name != 'workflow_dispatch' || inputs.route != 'update'
+    if: needs.pick-releases.outputs.tags != '' && (github.event_name != 'workflow_dispatch' || inputs.route != 'update')
     needs: pick-releases
     strategy:
       fail-fast: false
